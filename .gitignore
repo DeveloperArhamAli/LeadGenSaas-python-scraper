@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables (CRITICAL for security)
+.env
+.flaskenv
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Flask-specific
+instance/
+.webassets-cache
+
+# Databases
+*.db
+*.sqlite
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
