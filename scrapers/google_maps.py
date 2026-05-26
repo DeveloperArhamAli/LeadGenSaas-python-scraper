@@ -41,6 +41,9 @@ class GoogleMapsScraper:
         options.add_argument('--disable-dev-shm-usage')
         options.add_argument('--disable-gpu')
         options.add_argument('--window-size=1920,1080')
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--remote-debugging-port=9222")
 
         # Suppress logs
         options.add_argument('--log-level=3')
@@ -288,18 +291,24 @@ class GoogleMapsScraper:
         try:
             self.driver.get(lead['mapsUrl'])
 
-            WebDriverWait(self.driver, 10).until(
+            # Wait for the page to fully settle — h1 alone isn't enough
+            WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, 'h1'))
             )
-            time.sleep(2)
 
-            # ── Phone extraction (priority order) ──────────────────────────────
+            # Scroll down to force lazy-loaded contact info to render
+            self.driver.execute_script("window.scrollBy(0, 400)")
+            time.sleep(2.5)
+
+            # ── Phone ──────────────────────────────────────────────────────
             if not lead['phone']:
                 lead['phone'] = self._extract_phone_from_profile()
                 if lead['phone']:
                     logger.info(f"      📞 Found phone: {lead['phone']}")
+                else:
+                    logger.info(f"      ⚠️  No phone found for: {lead['businessName']}")
 
-            # ── Website (if not already found) ─────────────────────────────────
+            # ── Website (if not already found) ─────────────────────────────
             if not lead['website']:
                 try:
                     for selector in [
@@ -317,7 +326,7 @@ class GoogleMapsScraper:
                 except Exception:
                     pass
 
-            # ── Social media from page source ───────────────────────────────────
+            # ── Social media from page source ───────────────────────────────
             social = self.extract_social_from_html(self.driver.page_source)
             for key, val in social.items():
                 if val and not lead.get(key):
@@ -335,19 +344,24 @@ class GoogleMapsScraper:
 
     def _extract_phone_from_profile(self):
         """
-        Try multiple strategies to pull a phone number from the currently
-        loaded Google Maps business profile page.
+        Extract phone number from the currently loaded Google Maps profile page.
 
-        Priority:
-          1. tel: href link  — most reliable, always formatted correctly
-          2. aria-label on button/span elements
-          3. data-item-id containing "phone"
-          4. Regex on page source (conservative patterns only)
+        Strategy order:
+          1. Wait for and click the tel: link — most reliable
+          2. aria-label on known button selectors
+          3. data-item-id containing the phone directly
+          4. Scan visible text of known contact info containers
+          5. Regex on visible body text only — last resort, strict patterns with
+             digit-count validation to prevent false positives from JS/HTML noise
         """
 
-        # 1. tel: link — Google Maps wraps the phone number in an <a href="tel:...">
+        # 1. Wait explicitly for a tel: link to appear (up to 5s)
+        #    This is the most reliable source — Google wraps the phone in
+        #    <a href="tel:+923001234567"> which is always correctly formatted.
         try:
-            tel_el = self.driver.find_element(By.CSS_SELECTOR, 'a[href^="tel:"]')
+            tel_el = WebDriverWait(self.driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, 'a[href^="tel:"]'))
+            )
             raw = tel_el.get_attribute('href').replace('tel:', '').strip()
             cleaned = self.clean_phone(raw)
             if cleaned:
@@ -355,13 +369,14 @@ class GoogleMapsScraper:
         except Exception:
             pass
 
-        # 2. aria-label on interactive elements
+        # 2. aria-label / data-tooltip on button and span elements
         phone_selectors = [
             'button[data-item-id*="phone"]',
             'button[aria-label*="Phone"]',
             'button[aria-label*="phone"]',
             'span[aria-label*="Phone"]',
             '[data-tooltip*="phone"]',
+            '[data-tooltip*="Phone"]',
         ]
         for selector in phone_selectors:
             try:
@@ -377,7 +392,7 @@ class GoogleMapsScraper:
             except Exception:
                 continue
 
-        # 3. data-item-id attribute that contains the phone number itself
+        # 3. data-item-id that encodes the phone number directly
         try:
             el = self.driver.find_element(By.CSS_SELECTOR, '[data-item-id*="phone:tel:"]')
             raw = el.get_attribute('data-item-id').split('phone:tel:')[-1].strip()
@@ -387,21 +402,56 @@ class GoogleMapsScraper:
         except Exception:
             pass
 
-        # 4. Regex fallback on page source — conservative patterns only
-        #    We deliberately skip the loose \d{8,} pattern to avoid false positives.
-        page_source = self.driver.page_source
-        phone_patterns = [
-            r'\+\d{1,3}[\s\-]?\(?\d{1,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}',  # intl format
-            r'\(?\d{3}\)?[\s\-]\d{3}[\s\-]\d{4}',                             # US/CA format
-            r'\d{3}[\s\-]\d{4}[\s\-]\d{4}',                                   # PK/IN format
-            r'\d{4}[\s\-]\d{7}',                                               # common PK local
+        # 4. Scan visible text of contact info containers
+        #    Reading .text directly avoids false positives from raw HTML attributes.
+        contact_selectors = [
+            '[data-item-id*="phone"]',
+            'button[jsaction*="phone"]',
+            'div[jsaction*="phone"]',
+            '[aria-label*="phone" i]',
         ]
-        for pattern in phone_patterns:
-            match = re.search(pattern, page_source)
-            if match:
-                cleaned = self.clean_phone(match.group().strip())
-                if cleaned:
-                    return cleaned
+        for selector in contact_selectors:
+            try:
+                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                for el in elements:
+                    text = el.text.strip()
+                    if text:
+                        cleaned = self.clean_phone(text)
+                        if cleaned:
+                            return cleaned
+            except Exception:
+                continue
+
+        # 5. Regex on visible body text ONLY (not page_source)
+        #    Using body.text avoids matching JS variables, meta tags, HTML
+        #    attributes, and script blocks — which is what caused the repeated
+        #    5-digit false positive in the original implementation.
+        try:
+            body_text = self.driver.find_element(By.TAG_NAME, 'body').text
+        except Exception:
+            body_text = ''
+
+        # Each tuple: (pattern, min_digits, max_digits)
+        # The digit range rejects short IDs and partial matches.
+        phone_patterns = [
+            # International: +92 333 1234567 / +1 (800) 555-1234
+            (r'\+\d{1,3}[\s\-]?\(?\d{2,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{4,7}', 10, 15),
+            # Pakistani mobile: 0300 1234567 / 0321-1234567
+            (r'0\d{2,3}[\s\-]?\d{7,8}', 10, 12),
+            # Pakistani landline: 021-12345678 / 042 12345678
+            (r'0\d{2}[\s\-]\d{7,8}', 10, 11),
+            # US/CA: (800) 555-1234 / 800-555-1234
+            (r'\(?\d{3}\)?[\s\-]\d{3}[\s\-]\d{4}', 10, 10),
+        ]
+
+        for pattern, min_digits, max_digits in phone_patterns:
+            for match in re.finditer(pattern, body_text):
+                raw = match.group().strip()
+                digit_count = sum(c.isdigit() for c in raw)
+                if min_digits <= digit_count <= max_digits:
+                    cleaned = self.clean_phone(raw)
+                    if cleaned:
+                        return cleaned
 
         return None
 
@@ -616,7 +666,7 @@ class GoogleMapsScraper:
         Normalize a raw phone string.
         - Strips label prefixes like "Phone:", "Call:", "Tel:"
         - Keeps only digits, +, spaces, dashes, parentheses
-        - Returns None if nothing meaningful remains
+        - Returns None if fewer than 7 digits remain
         """
         if not text:
             return None
